@@ -21,7 +21,7 @@
  *
  * Authors: Alex Deucher
  */
-#include <drm/drmP.h>
+
 #include "radeon.h"
 #include "radeon_asic.h"
 #include "radeon_trace.h"
@@ -123,7 +123,6 @@ void si_dma_vm_write_pages(struct radeon_device *rdev,
 		for (; ndw > 0; ndw -= 2, --count, pe += 8) {
 			if (flags & R600_PTE_SYSTEM) {
 				value = radeon_vm_map_gart(rdev, addr);
-				value &= 0xFFFFFFFFFFFFF000ULL;
 			} else if (flags & R600_PTE_VALID) {
 				value = addr;
 			} else {
@@ -206,6 +205,14 @@ void si_dma_vm_flush(struct radeon_device *rdev, struct radeon_ring *ring,
 	radeon_ring_write(ring, DMA_PACKET(DMA_PACKET_SRBM_WRITE, 0, 0, 0, 0));
 	radeon_ring_write(ring, (0xf << 16) | (VM_INVALIDATE_REQUEST >> 2));
 	radeon_ring_write(ring, 1 << vm_id);
+
+	/* wait for invalidate to complete */
+	radeon_ring_write(ring, DMA_PACKET(DMA_PACKET_POLL_REG_MEM, 0, 0, 0, 0));
+	radeon_ring_write(ring, VM_INVALIDATE_REQUEST);
+	radeon_ring_write(ring, 0xff << 16); /* retry */
+	radeon_ring_write(ring, 1 << vm_id); /* mask */
+	radeon_ring_write(ring, 0); /* value */
+	radeon_ring_write(ring, (0 << 28) | 0x20); /* func(always) | poll interval */
 }
 
 /**
@@ -224,7 +231,7 @@ void si_dma_vm_flush(struct radeon_device *rdev, struct radeon_ring *ring,
 struct radeon_fence *si_copy_dma(struct radeon_device *rdev,
 				 uint64_t src_offset, uint64_t dst_offset,
 				 unsigned num_gpu_pages,
-				 struct reservation_object *resv)
+				 struct dma_resv *resv)
 {
 	struct radeon_fence *fence;
 	struct radeon_sync sync;

@@ -1,12 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Regulator driver for the Richtek RT5033
  *
  * Copyright (C) 2014 Samsung Electronics, Co., Ltd.
  * Author: Beomho Seo <beomho.seo@samsung.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published bythe Free Software Foundation.
  */
 
 #include <linux/module.h>
@@ -16,14 +13,14 @@
 #include <linux/mfd/rt5033-private.h>
 #include <linux/regulator/of_regulator.h>
 
-static struct regulator_ops rt5033_safe_ldo_ops = {
+static const struct regulator_ops rt5033_safe_ldo_ops = {
 	.is_enabled		= regulator_is_enabled_regmap,
 	.enable			= regulator_enable_regmap,
 	.disable		= regulator_disable_regmap,
 	.list_voltage		= regulator_list_voltage_linear,
 };
 
-static struct regulator_ops rt5033_buck_ops = {
+static const struct regulator_ops rt5033_buck_ops = {
 	.is_enabled		= regulator_is_enabled_regmap,
 	.enable			= regulator_enable_regmap,
 	.disable		= regulator_disable_regmap,
@@ -36,6 +33,8 @@ static struct regulator_ops rt5033_buck_ops = {
 static const struct regulator_desc rt5033_supported_regulators[] = {
 	[RT5033_BUCK] = {
 		.name		= "BUCK",
+		.of_match	= of_match_ptr("BUCK"),
+		.regulators_node = of_match_ptr("regulators"),
 		.id		= RT5033_BUCK,
 		.ops		= &rt5033_buck_ops,
 		.type		= REGULATOR_VOLTAGE,
@@ -50,6 +49,8 @@ static const struct regulator_desc rt5033_supported_regulators[] = {
 	},
 	[RT5033_LDO] = {
 		.name		= "LDO",
+		.of_match	= of_match_ptr("LDO"),
+		.regulators_node = of_match_ptr("regulators"),
 		.id		= RT5033_LDO,
 		.ops		= &rt5033_buck_ops,
 		.type		= REGULATOR_VOLTAGE,
@@ -64,6 +65,8 @@ static const struct regulator_desc rt5033_supported_regulators[] = {
 	},
 	[RT5033_SAFE_LDO] = {
 		.name		= "SAFE_LDO",
+		.of_match	= of_match_ptr("SAFE_LDO"),
+		.regulators_node = of_match_ptr("regulators"),
 		.id		= RT5033_SAFE_LDO,
 		.ops		= &rt5033_safe_ldo_ops,
 		.type		= REGULATOR_VOLTAGE,
@@ -81,7 +84,7 @@ static int rt5033_regulator_probe(struct platform_device *pdev)
 	int ret, i;
 	struct regulator_config config = {};
 
-	config.dev = &pdev->dev;
+	config.dev = rt5033->dev;
 	config.driver_data = rt5033;
 
 	for (i = 0; i < ARRAY_SIZE(rt5033_supported_regulators); i++) {

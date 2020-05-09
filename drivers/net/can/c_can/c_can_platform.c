@@ -39,10 +39,11 @@
 
 #include "c_can.h"
 
-#define DCAN_RAM_INIT_BIT		(1 << 3)
+#define DCAN_RAM_INIT_BIT BIT(3)
+
 static DEFINE_SPINLOCK(raminit_lock);
-/*
- * 16-bit c_can registers can be arranged differently in the memory
+
+/* 16-bit c_can registers can be arranged differently in the memory
  * architecture of different implementations. For example: 16-bit
  * registers can be aligned to a 16-bit boundary or 32-bit boundary etc.
  * Handle the same by providing a common read/write interface.
@@ -54,7 +55,7 @@ static u16 c_can_plat_read_reg_aligned_to_16bit(const struct c_can_priv *priv,
 }
 
 static void c_can_plat_write_reg_aligned_to_16bit(const struct c_can_priv *priv,
-						enum reg index, u16 val)
+						  enum reg index, u16 val)
 {
 	writew(val, priv->base + priv->regs[index]);
 }
@@ -66,7 +67,7 @@ static u16 c_can_plat_read_reg_aligned_to_32bit(const struct c_can_priv *priv,
 }
 
 static void c_can_plat_write_reg_aligned_to_32bit(const struct c_can_priv *priv,
-						enum reg index, u16 val)
+						  enum reg index, u16 val)
 {
 	writew(val, priv->base + 2 * priv->regs[index]);
 }
@@ -103,27 +104,34 @@ static void c_can_hw_raminit_syscon(const struct c_can_priv *priv, bool enable)
 	mask = 1 << raminit->bits.start | 1 << raminit->bits.done;
 	regmap_read(raminit->syscon, raminit->reg, &ctrl);
 
-	/* We clear the done and start bit first. The start bit is
+	/* We clear the start bit first. The start bit is
 	 * looking at the 0 -> transition, but is not self clearing;
-	 * And we clear the init done bit as well.
 	 * NOTE: DONE must be written with 1 to clear it.
+	 * We can't clear the DONE bit here using regmap_update_bits()
+	 * as it will bypass the write if initial condition is START:0 DONE:1
+	 * e.g. on DRA7 which needs START pulse.
 	 */
-	ctrl &= ~(1 << raminit->bits.start);
-	ctrl |= 1 << raminit->bits.done;
-	regmap_write(raminit->syscon, raminit->reg, ctrl);
+	ctrl &= ~mask;	/* START = 0, DONE = 0 */
+	regmap_update_bits(raminit->syscon, raminit->reg, mask, ctrl);
 
-	ctrl &= ~(1 << raminit->bits.done);
-	c_can_hw_raminit_wait_syscon(priv, mask, ctrl);
+	/* check if START bit is 0. Ignore DONE bit for now
+	 * as it can be either 0 or 1.
+	 */
+	c_can_hw_raminit_wait_syscon(priv, 1 << raminit->bits.start, ctrl);
 
 	if (enable) {
-		/* Set start bit and wait for the done bit. */
+		/* Clear DONE bit & set START bit. */
 		ctrl |= 1 << raminit->bits.start;
-		regmap_write(raminit->syscon, raminit->reg, ctrl);
-
+		/* DONE must be written with 1 to clear it */
+		ctrl |= 1 << raminit->bits.done;
+		regmap_update_bits(raminit->syscon, raminit->reg, mask, ctrl);
+		/* prevent further clearing of DONE bit */
+		ctrl &= ~(1 << raminit->bits.done);
 		/* clear START bit if start pulse is needed */
 		if (raminit->needs_pulse) {
 			ctrl &= ~(1 << raminit->bits.start);
-			regmap_write(raminit->syscon, raminit->reg, ctrl);
+			regmap_update_bits(raminit->syscon, raminit->reg,
+					   mask, ctrl);
 		}
 
 		ctrl |= 1 << raminit->bits.done;
@@ -137,13 +145,13 @@ static u32 c_can_plat_read_reg32(const struct c_can_priv *priv, enum reg index)
 	u32 val;
 
 	val = priv->read_reg(priv, index);
-	val |= ((u32) priv->read_reg(priv, index + 1)) << 16;
+	val |= ((u32)priv->read_reg(priv, index + 1)) << 16;
 
 	return val;
 }
 
-static void c_can_plat_write_reg32(const struct c_can_priv *priv, enum reg index,
-		u32 val)
+static void c_can_plat_write_reg32(const struct c_can_priv *priv,
+				   enum reg index, u32 val)
 {
 	priv->write_reg(priv, index + 1, val >> 16);
 	priv->write_reg(priv, index, val);
@@ -154,8 +162,8 @@ static u32 d_can_plat_read_reg32(const struct c_can_priv *priv, enum reg index)
 	return readl(priv->base + priv->regs[index]);
 }
 
-static void d_can_plat_write_reg32(const struct c_can_priv *priv, enum reg index,
-		u32 val)
+static void d_can_plat_write_reg32(const struct c_can_priv *priv,
+				   enum reg index, u32 val)
 {
 	writel(val, priv->base + priv->regs[index]);
 }
@@ -213,7 +221,7 @@ static const struct c_can_driver_data am3352_dcan_drvdata = {
 	.raminit_bits = am3352_raminit_bits,
 };
 
-static struct platform_device_id c_can_id_table[] = {
+static const struct platform_device_id c_can_id_table[] = {
 	{
 		.name = KBUILD_MODNAME,
 		.driver_data = (kernel_ulong_t)&c_can_drvdata,
@@ -313,7 +321,6 @@ static int c_can_plat_probe(struct platform_device *pdev)
 		break;
 	case BOSCH_D_CAN:
 		priv->regs = reg_map_d_can;
-		priv->can.ctrlmode_supported |= CAN_CTRLMODE_3_SAMPLES;
 		priv->read_reg = c_can_plat_read_reg_aligned_to_16bit;
 		priv->write_reg = c_can_plat_write_reg_aligned_to_16bit;
 		priv->read_reg32 = d_can_plat_read_reg32;

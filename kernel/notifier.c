@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #include <linux/kdebug.h>
 #include <linux/kprobes.h>
 #include <linux/export.h>
@@ -22,21 +23,10 @@ static int notifier_chain_register(struct notifier_block **nl,
 		struct notifier_block *n)
 {
 	while ((*nl) != NULL) {
-		if (n->priority > (*nl)->priority)
-			break;
-		nl = &((*nl)->next);
-	}
-	n->next = *nl;
-	rcu_assign_pointer(*nl, n);
-	return 0;
-}
-
-static int notifier_chain_cond_register(struct notifier_block **nl,
-		struct notifier_block *n)
-{
-	while ((*nl) != NULL) {
-		if ((*nl) == n)
+		if (unlikely((*nl) == n)) {
+			WARN(1, "double register detected");
 			return 0;
+		}
 		if (n->priority > (*nl)->priority)
 			break;
 		nl = &((*nl)->next);
@@ -95,7 +85,7 @@ static int notifier_call_chain(struct notifier_block **nl,
 		if (nr_calls)
 			(*nr_calls)++;
 
-		if ((ret & NOTIFY_STOP_MASK) == NOTIFY_STOP_MASK)
+		if (ret & NOTIFY_STOP_MASK)
 			break;
 		nb = next_nb;
 		nr_to_call--;
@@ -229,29 +219,6 @@ int blocking_notifier_chain_register(struct blocking_notifier_head *nh,
 	return ret;
 }
 EXPORT_SYMBOL_GPL(blocking_notifier_chain_register);
-
-/**
- *	blocking_notifier_chain_cond_register - Cond add notifier to a blocking notifier chain
- *	@nh: Pointer to head of the blocking notifier chain
- *	@n: New entry in notifier chain
- *
- *	Adds a notifier to a blocking notifier chain, only if not already
- *	present in the chain.
- *	Must be called in process context.
- *
- *	Currently always returns zero.
- */
-int blocking_notifier_chain_cond_register(struct blocking_notifier_head *nh,
-		struct notifier_block *n)
-{
-	int ret;
-
-	down_write(&nh->rwsem);
-	ret = notifier_chain_cond_register(&nh->head, n);
-	up_write(&nh->rwsem);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(blocking_notifier_chain_cond_register);
 
 /**
  *	blocking_notifier_chain_unregister - Remove notifier from a blocking notifier chain
@@ -402,6 +369,7 @@ int raw_notifier_call_chain(struct raw_notifier_head *nh,
 }
 EXPORT_SYMBOL_GPL(raw_notifier_call_chain);
 
+#ifdef CONFIG_SRCU
 /*
  *	SRCU notifier chain routines.    Registration and unregistration
  *	use a mutex, and call_chain is synchronized by SRCU (no locks).
@@ -528,6 +496,8 @@ void srcu_init_notifier_head(struct srcu_notifier_head *nh)
 }
 EXPORT_SYMBOL_GPL(srcu_init_notifier_head);
 
+#endif /* CONFIG_SRCU */
+
 static ATOMIC_NOTIFIER_HEAD(die_chain);
 
 int notrace notify_die(enum die_val val, const char *str,
@@ -541,13 +511,15 @@ int notrace notify_die(enum die_val val, const char *str,
 		.signr	= sig,
 
 	};
+	RCU_LOCKDEP_WARN(!rcu_is_watching(),
+			   "notify_die called but RCU thinks we're quiescent");
 	return atomic_notifier_call_chain(&die_chain, val, &args);
 }
 NOKPROBE_SYMBOL(notify_die);
 
 int register_die_notifier(struct notifier_block *nb)
 {
-	vmalloc_sync_all();
+	vmalloc_sync_mappings();
 	return atomic_notifier_chain_register(&die_chain, nb);
 }
 EXPORT_SYMBOL_GPL(register_die_notifier);

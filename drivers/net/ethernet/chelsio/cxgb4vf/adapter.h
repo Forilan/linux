@@ -92,10 +92,14 @@ struct sge_rspq;
  */
 struct port_info {
 	struct adapter *adapter;	/* our adapter */
+	u32 vlan_id;			/* vlan id for VST */
 	u16 viid;			/* virtual interface ID */
-	s16 xact_addr_filt;		/* index of our MAC address filter */
+	int xact_addr_filt;		/* index of our MAC address filter */
 	u16 rss_size;			/* size of VI's RSS table slice */
 	u8 pidx;			/* index into adapter port[] */
+	s8 mdio_addr;
+	u8 port_type;			/* firmware port type */
+	u8 mod_type;			/* firmware module type */
 	u8 port_id;			/* physical port ID */
 	u8 nqsets;			/* # of "Queue Sets" */
 	u8 first_qset;			/* index of first "Queue Set" */
@@ -345,6 +349,16 @@ struct sge {
 #define for_each_ethrxq(sge, iter) \
 	for (iter = 0; iter < (sge)->ethqsets; iter++)
 
+struct hash_mac_addr {
+	struct list_head list;
+	u8 addr[ETH_ALEN];
+	unsigned int iface_mac;
+};
+
+struct mbox_list {
+	struct list_head list;
+};
+
 /*
  * Per-"adapter" (Virtual Function) information.
  */
@@ -378,13 +392,26 @@ struct adapter {
 
 	/* various locks */
 	spinlock_t stats_lock;
+
+	/* lock for mailbox cmd list */
+	spinlock_t mbox_lock;
+	struct mbox_list mlist;
+
+	/* support for mailbox command/reply logging */
+#define T4VF_OS_LOG_MBOX_CMDS 256
+	struct mbox_cmd_log *mbox_log;
+
+	/* list of MAC addresses in MPS Hash */
+	struct list_head mac_hlist;
 };
 
 enum { /* adapter flags */
-	FULL_INIT_DONE     = (1UL << 0),
-	USING_MSI          = (1UL << 1),
-	USING_MSIX         = (1UL << 2),
-	QUEUES_BOUND       = (1UL << 3),
+	CXGB4VF_FULL_INIT_DONE			= (1UL << 0),
+	CXGB4VF_USING_MSI			= (1UL << 1),
+	CXGB4VF_USING_MSIX			= (1UL << 2),
+	CXGB4VF_QUEUES_BOUND			= (1UL << 3),
+	CXGB4VF_ROOT_NO_RELAXED_ORDERING	= (1UL << 4),
+	CXGB4VF_FW_OK				= (1UL << 5),
 };
 
 /*
@@ -522,6 +549,7 @@ static inline struct adapter *netdev2adap(const struct net_device *dev)
  * is "contracted" to provide for the common code.
  */
 void t4vf_os_link_changed(struct adapter *, int, int);
+void t4vf_os_portmod_changed(struct adapter *, int);
 
 /*
  * SGE function prototype declarations.

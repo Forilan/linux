@@ -1,7 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2014 Google, Inc.
- *
- * Licensed under the terms of the GNU GPL License version 2
  *
  * Selftests for execveat(2).
  */
@@ -20,6 +19,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "../kselftest.h"
+
 static char longpath[2 * PATH_MAX] = "";
 static char *envp[] = { "IN_TEST=yes", NULL, NULL };
 static char *argv[] = { "execveat", "99", NULL };
@@ -30,7 +31,7 @@ static int execveat_(int fd, const char *path, char **argv, char **envp,
 #ifdef __NR_execveat
 	return syscall(__NR_execveat, fd, path, argv, envp, flags);
 #else
-	errno = -ENOSYS;
+	errno = ENOSYS;
 	return -1;
 #endif
 }
@@ -62,7 +63,7 @@ static int _check_execveat_fail(int fd, const char *path, int flags,
 }
 
 static int check_execveat_invoked_rc(int fd, const char *path, int flags,
-				     int expected_rc)
+				     int expected_rc, int expected_rc2)
 {
 	int status;
 	int rc;
@@ -98,9 +99,10 @@ static int check_execveat_invoked_rc(int fd, const char *path, int flags,
 			child, status);
 		return 1;
 	}
-	if (WEXITSTATUS(status) != expected_rc) {
-		printf("[FAIL] (child %d exited with %d not %d)\n",
-			child, WEXITSTATUS(status), expected_rc);
+	if ((WEXITSTATUS(status) != expected_rc) &&
+	    (WEXITSTATUS(status) != expected_rc2)) {
+		printf("[FAIL] (child %d exited with %d not %d nor %d)\n",
+			child, WEXITSTATUS(status), expected_rc, expected_rc2);
 		return 1;
 	}
 	printf("[OK]\n");
@@ -109,7 +111,7 @@ static int check_execveat_invoked_rc(int fd, const char *path, int flags,
 
 static int check_execveat(int fd, const char *path, int flags)
 {
-	return check_execveat_invoked_rc(fd, path, flags, 99);
+	return check_execveat_invoked_rc(fd, path, flags, 99, 99);
 }
 
 static char *concat(const char *left, const char *right)
@@ -146,7 +148,7 @@ static void exe_cp(const char *src, const char *dest)
 }
 
 #define XX_DIR_LEN 200
-static int check_execveat_pathmax(int dot_dfd, const char *src, int is_script)
+static int check_execveat_pathmax(int root_dfd, const char *src, int is_script)
 {
 	int fail = 0;
 	int ii, count, len;
@@ -155,20 +157,30 @@ static int check_execveat_pathmax(int dot_dfd, const char *src, int is_script)
 
 	if (*longpath == '\0') {
 		/* Create a filename close to PATH_MAX in length */
+		char *cwd = getcwd(NULL, 0);
+
+		if (!cwd) {
+			printf("Failed to getcwd(), errno=%d (%s)\n",
+			       errno, strerror(errno));
+			return 2;
+		}
+		strcpy(longpath, cwd);
+		strcat(longpath, "/");
 		memset(longname, 'x', XX_DIR_LEN - 1);
 		longname[XX_DIR_LEN - 1] = '/';
 		longname[XX_DIR_LEN] = '\0';
-		count = (PATH_MAX - 3) / XX_DIR_LEN;
+		count = (PATH_MAX - 3 - strlen(cwd)) / XX_DIR_LEN;
 		for (ii = 0; ii < count; ii++) {
 			strcat(longpath, longname);
 			mkdir(longpath, 0755);
 		}
-		len = (PATH_MAX - 3) - (count * XX_DIR_LEN);
+		len = (PATH_MAX - 3 - strlen(cwd)) - (count * XX_DIR_LEN);
 		if (len <= 0)
 			len = 1;
 		memset(longname, 'y', len);
 		longname[len] = '\0';
 		strcat(longpath, longname);
+		free(cwd);
 	}
 	exe_cp(src, longpath);
 
@@ -179,24 +191,30 @@ static int check_execveat_pathmax(int dot_dfd, const char *src, int is_script)
 	 */
 	fd = open(longpath, O_RDONLY);
 	if (fd > 0) {
-		printf("Invoke copy of '%s' via filename of length %lu:\n",
+		printf("Invoke copy of '%s' via filename of length %zu:\n",
 			src, strlen(longpath));
 		fail += check_execveat(fd, "", AT_EMPTY_PATH);
 	} else {
-		printf("Failed to open length %lu filename, errno=%d (%s)\n",
+		printf("Failed to open length %zu filename, errno=%d (%s)\n",
 			strlen(longpath), errno, strerror(errno));
 		fail++;
 	}
 
 	/*
-	 * Execute as a long pathname relative to ".".  If this is a script,
+	 * Execute as a long pathname relative to "/".  If this is a script,
 	 * the interpreter will launch but fail to open the script because its
 	 * name ("/dev/fd/5/xxx....") is bigger than PATH_MAX.
+	 *
+	 * The failure code is usually 127 (POSIX: "If a command is not found,
+	 * the exit status shall be 127."), but some systems give 126 (POSIX:
+	 * "If the command name is found, but it is not an executable utility,
+	 * the exit status shall be 126."), so allow either.
 	 */
 	if (is_script)
-		fail += check_execveat_invoked_rc(dot_dfd, longpath, 0, 127);
+		fail += check_execveat_invoked_rc(root_dfd, longpath + 1, 0,
+						  127, 126);
 	else
-		fail += check_execveat(dot_dfd, longpath, 0);
+		fail += check_execveat(root_dfd, longpath + 1, 0);
 
 	return fail;
 }
@@ -211,6 +229,7 @@ static int run_tests(void)
 	int subdir_dfd_ephemeral = open_or_die("subdir.ephemeral",
 					       O_DIRECTORY|O_RDONLY);
 	int dot_dfd = open_or_die(".", O_DIRECTORY|O_RDONLY);
+	int root_dfd = open_or_die("/", O_DIRECTORY|O_RDONLY);
 	int dot_dfd_path = open_or_die(".", O_DIRECTORY|O_RDONLY|O_PATH);
 	int dot_dfd_cloexec = open_or_die(".", O_DIRECTORY|O_RDONLY|O_CLOEXEC);
 	int fd = open_or_die("execveat", O_RDONLY);
@@ -226,6 +245,14 @@ static int run_tests(void)
 	int fd_script_ephemeral = open_or_die("script.ephemeral", O_RDONLY);
 	int fd_cloexec = open_or_die("execveat", O_RDONLY|O_CLOEXEC);
 	int fd_script_cloexec = open_or_die("script", O_RDONLY|O_CLOEXEC);
+
+	/* Check if we have execveat at all, and bail early if not */
+	errno = 0;
+	execveat_(-1, NULL, NULL, NULL, 0);
+	if (errno == ENOSYS) {
+		ksft_exit_skip(
+			"ENOSYS calling execveat - no kernel support?\n");
+	}
 
 	/* Change file position to confirm it doesn't affect anything */
 	lseek(fd, 10, SEEK_SET);
@@ -338,8 +365,8 @@ static int run_tests(void)
 	/* Attempt to execute relative to non-directory => ENOTDIR */
 	fail += check_execveat_fail(fd, "execveat", 0, ENOTDIR);
 
-	fail += check_execveat_pathmax(dot_dfd, "execveat", 0);
-	fail += check_execveat_pathmax(dot_dfd, "script", 1);
+	fail += check_execveat_pathmax(root_dfd, "execveat", 0);
+	fail += check_execveat_pathmax(root_dfd, "script", 1);
 	return fail;
 }
 

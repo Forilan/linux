@@ -13,6 +13,7 @@
 
 #include <linux/signal.h>
 #include <linux/sched.h>
+#include <linux/sched/debug.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/errno.h>
@@ -21,9 +22,8 @@
 #include <linux/ptrace.h>
 #include <linux/mman.h>
 #include <linux/mm.h>
-#include <linux/module.h>
+#include <linux/extable.h>
 #include <linux/uaccess.h>
-#include <linux/ptrace.h>
 
 #include <asm/mmu_context.h>
 #include <asm/traps.h>
@@ -46,8 +46,8 @@ asmlinkage void do_page_fault(struct pt_regs *regs, unsigned long cause,
 	struct task_struct *tsk = current;
 	struct mm_struct *mm = tsk->mm;
 	int code = SEGV_MAPERR;
-	int fault;
-	unsigned int flags = 0;
+	vm_fault_t fault;
+	unsigned int flags = FAULT_FLAG_DEFAULT;
 
 	cause >>= 2;
 
@@ -77,7 +77,7 @@ asmlinkage void do_page_fault(struct pt_regs *regs, unsigned long cause,
 	 * If we're in an interrupt or have no user
 	 * context, we must not take the fault..
 	 */
-	if (in_atomic() || !mm)
+	if (faulthandler_disabled() || !mm)
 		goto bad_area_nosemaphore;
 
 	if (user_mode(regs))
@@ -86,6 +86,7 @@ asmlinkage void do_page_fault(struct pt_regs *regs, unsigned long cause,
 	if (!down_read_trylock(&mm->mmap_sem)) {
 		if (!user_mode(regs) && !search_exception_tables(regs->ea))
 			goto bad_area_nosemaphore;
+retry:
 		down_read(&mm->mmap_sem);
 	}
 
@@ -125,24 +126,48 @@ good_area:
 		break;
 	}
 
-survive:
 	/*
 	 * If for any reason at all we couldn't handle the fault,
 	 * make sure we exit gracefully rather than endlessly redo
 	 * the fault.
 	 */
-	fault = handle_mm_fault(mm, vma, address, flags);
+	fault = handle_mm_fault(vma, address, flags);
+
+	if (fault_signal_pending(fault, regs))
+		return;
+
 	if (unlikely(fault & VM_FAULT_ERROR)) {
 		if (fault & VM_FAULT_OOM)
 			goto out_of_memory;
+		else if (fault & VM_FAULT_SIGSEGV)
+			goto bad_area;
 		else if (fault & VM_FAULT_SIGBUS)
 			goto do_sigbus;
 		BUG();
 	}
-	if (fault & VM_FAULT_MAJOR)
-		tsk->maj_flt++;
-	else
-		tsk->min_flt++;
+
+	/*
+	 * Major/minor page fault accounting is only done on the
+	 * initial attempt. If we go through a retry, it is extremely
+	 * likely that the page will be found in page cache at that point.
+	 */
+	if (flags & FAULT_FLAG_ALLOW_RETRY) {
+		if (fault & VM_FAULT_MAJOR)
+			current->maj_flt++;
+		else
+			current->min_flt++;
+		if (fault & VM_FAULT_RETRY) {
+			flags |= FAULT_FLAG_TRIED;
+
+			/*
+			 * No need to up_read(&mm->mmap_sem) as we would
+			 * have already released it in __lock_page_or_retry
+			 * in mm/filemap.c.
+			 */
+
+			goto retry;
+		}
+	}
 
 	up_read(&mm->mmap_sem);
 	return;
@@ -157,9 +182,11 @@ bad_area:
 bad_area_nosemaphore:
 	/* User mode accesses just cause a SIGSEGV */
 	if (user_mode(regs)) {
-		pr_alert("%s: unhandled page fault (%d) at 0x%08lx, "
-			"cause %ld\n", current->comm, SIGSEGV, address, cause);
-		show_regs(regs);
+		if (unhandled_signal(current, SIGSEGV) && printk_ratelimit()) {
+			pr_info("%s: unhandled page fault (%d) at 0x%08lx, "
+				"cause %ld\n", current->comm, SIGSEGV, address, cause);
+			show_regs(regs);
+		}
 		_exception(SIGSEGV, regs, code, address);
 		return;
 	}
@@ -189,11 +216,6 @@ no_context:
  */
 out_of_memory:
 	up_read(&mm->mmap_sem);
-	if (is_global_init(tsk)) {
-		yield();
-		down_read(&mm->mmap_sem);
-		goto survive;
-	}
 	if (!user_mode(regs))
 		goto no_context;
 	pagefault_out_of_memory();
@@ -245,7 +267,7 @@ vmalloc_fault:
 		if (!pte_present(*pte_k))
 			goto no_context;
 
-		flush_tlb_one(address);
+		flush_tlb_kernel_page(address);
 		return;
 	}
 }

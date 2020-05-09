@@ -1,18 +1,10 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * CAN driver for PEAK System PCAN-USB Pro adapter
  * Derived from the PCAN project file driver/src/pcan_usbpro_fw.h
  *
  * Copyright (C) 2003-2011 PEAK System-Technik GmbH
  * Copyright (C) 2011-2012 Stephane Grosjean <s.grosjean@peak-system.com>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published
- * by the Free Software Foundation; version 2 of the License.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
  */
 #ifndef PCAN_USB_PRO_H
 #define PCAN_USB_PRO_H
@@ -26,6 +18,14 @@
 /* Vendor Request value for XXX_INFO */
 #define PCAN_USBPRO_INFO_BL		0
 #define PCAN_USBPRO_INFO_FW		1
+
+/* PCAN-USB Pro (FD) Endpoints */
+#define PCAN_USBPRO_EP_CMDOUT		1
+#define PCAN_USBPRO_EP_CMDIN		(PCAN_USBPRO_EP_CMDOUT | USB_DIR_IN)
+#define PCAN_USBPRO_EP_MSGOUT_0		2
+#define PCAN_USBPRO_EP_MSGIN		(PCAN_USBPRO_EP_MSGOUT_0 | USB_DIR_IN)
+#define PCAN_USBPRO_EP_MSGOUT_1		3
+#define PCAN_USBPRO_EP_UNUSED		(PCAN_USBPRO_EP_MSGOUT_1 | USB_DIR_IN)
 
 /* Vendor Request value for XXX_FCT */
 #define PCAN_USBPRO_FCT_DRVLD		5 /* tell device driver is loaded */
@@ -175,5 +175,10 @@ union pcan_usb_pro_rec {
 	struct pcan_usb_pro_rxts	rx_ts;
 	struct pcan_usb_pro_txmsg	tx_msg;
 };
+
+int pcan_usb_pro_probe(struct usb_interface *intf);
+int pcan_usb_pro_send_req(struct peak_usb_device *dev, int req_id,
+			  int req_value, void *req_addr, int req_size);
+void pcan_usb_pro_restart_complete(struct urb *urb);
 
 #endif

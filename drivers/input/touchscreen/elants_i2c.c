@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Elan Microelectronics touch panels with I2C interface
  *
@@ -10,7 +11,6 @@
  *  Copyright (c) 2010-2012 Benjamin Tissoires <benjamin.tissoires@gmail.com>
  *  Copyright (c) 2010-2012 Ecole Nationale de l'Aviation Civile, France
  *
- *
  * This code is partly based on i2c-hid.c:
  *
  * Copyright (c) 2012 Benjamin Tissoires <benjamin.tissoires@gmail.com>
@@ -18,33 +18,28 @@
  * Copyright (c) 2012 Red Hat, Inc
  */
 
-/*
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- */
 
 #include <linux/module.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
 #include <linux/platform_device.h>
 #include <linux/async.h>
 #include <linux/i2c.h>
 #include <linux/delay.h>
 #include <linux/uaccess.h>
 #include <linux/buffer_head.h>
-#include <linux/version.h>
 #include <linux/slab.h>
 #include <linux/firmware.h>
-#include <linux/version.h>
 #include <linux/input/mt.h>
 #include <linux/acpi.h>
 #include <linux/of.h>
+#include <linux/gpio/consumer.h>
+#include <linux/regulator/consumer.h>
 #include <asm/unaligned.h>
 
 /* Device, Driver information */
 #define DEVICE_NAME	"elants_i2c"
-#define DRV_VERSION	"1.0.9"
 
 /* Convert from rows or columns into resolution */
 #define ELAN_TS_RESOLUTION(n, m)   (((n) - 1) * (m))
@@ -64,8 +59,10 @@
 #define CMD_HEADER_WRITE	0x54
 #define CMD_HEADER_READ		0x53
 #define CMD_HEADER_6B_READ	0x5B
+#define CMD_HEADER_ROM_READ	0x96
 #define CMD_HEADER_RESP		0x52
 #define CMD_HEADER_6B_RESP	0x9B
+#define CMD_HEADER_ROM_RESP	0x95
 #define CMD_HEADER_HELLO	0x55
 #define CMD_HEADER_REK		0x66
 
@@ -100,10 +97,12 @@
 #define MAX_FW_UPDATE_RETRIES	30
 
 #define ELAN_FW_PAGESIZE	132
-#define ELAN_FW_FILENAME	"elants_i2c.bin"
 
 /* calibration timeout definition */
-#define ELAN_CALI_TIMEOUT_MSEC	10000
+#define ELAN_CALI_TIMEOUT_MSEC	12000
+
+#define ELAN_POWERON_DELAY_USEC	500
+#define ELAN_RESET_DELAY_MSEC	20
 
 enum elants_state {
 	ELAN_STATE_NORMAL,
@@ -120,6 +119,10 @@ enum elants_iap_mode {
 struct elants_data {
 	struct i2c_client *client;
 	struct input_dev *input;
+
+	struct regulator *vcc33;
+	struct regulator *vccio;
+	struct gpio_desc *reset_gpio;
 
 	u16 fw_version;
 	u8 test_version;
@@ -141,9 +144,11 @@ struct elants_data {
 	u8 cmd_resp[HEADER_SIZE];
 	struct completion cmd_done;
 
-	u8 buf[MAX_PACKET_SIZE];
-
 	bool wake_irq_enabled;
+	bool keep_power_in_suspend;
+
+	/* Must be last to be used for DMA operations */
+	u8 buf[MAX_PACKET_SIZE] ____cacheline_aligned;
 };
 
 static int elants_i2c_send(struct i2c_client *client,
@@ -195,6 +200,10 @@ static int elants_i2c_execute_command(struct i2c_client *client,
 
 	case CMD_HEADER_6B_READ:
 		expected_response = CMD_HEADER_6B_RESP;
+		break;
+
+	case CMD_HEADER_ROM_READ:
+		expected_response = CMD_HEADER_ROM_RESP;
 		break;
 
 	default:
@@ -291,7 +300,7 @@ static u16 elants_i2c_parse_version(u8 *buf)
 	return get_unaligned_be32(buf) >> 4;
 }
 
-static int elants_i2c_query_fw_id(struct elants_data *ts)
+static int elants_i2c_query_hw_version(struct elants_data *ts)
 {
 	struct i2c_client *client = ts->client;
 	int error, retry_cnt;
@@ -311,8 +320,13 @@ static int elants_i2c_query_fw_id(struct elants_data *ts)
 			error, (int)sizeof(resp), resp);
 	}
 
-	dev_err(&client->dev,
-		"Failed to read fw id or fw id is invalid\n");
+	if (error) {
+		dev_err(&client->dev,
+			"Failed to read fw id: %d\n", error);
+		return error;
+	}
+
+	dev_err(&client->dev, "Invalid fw id: %#04x\n", ts->hw_version);
 
 	return -EINVAL;
 }
@@ -501,7 +515,7 @@ static int elants_i2c_fastboot(struct i2c_client *client)
 static int elants_i2c_initialize(struct elants_data *ts)
 {
 	struct i2c_client *client = ts->client;
-	int error, retry_cnt;
+	int error, error2, retry_cnt;
 	const u8 hello_packet[] = { 0x55, 0x55, 0x55, 0x55 };
 	const u8 recov_packet[] = { 0x55, 0x55, 0x80, 0x80 };
 	u8 buf[HEADER_SIZE];
@@ -546,18 +560,22 @@ static int elants_i2c_initialize(struct elants_data *ts)
 		}
 	}
 
+	/* hw version is available even if device in recovery state */
+	error2 = elants_i2c_query_hw_version(ts);
+	if (!error2)
+		error2 = elants_i2c_query_bc_version(ts);
 	if (!error)
-		error = elants_i2c_query_fw_id(ts);
+		error = error2;
+
 	if (!error)
 		error = elants_i2c_query_fw_version(ts);
+	if (!error)
+		error = elants_i2c_query_test_version(ts);
+	if (!error)
+		error = elants_i2c_query_ts_info(ts);
 
-	if (error) {
+	if (error)
 		ts->iap_mode = ELAN_IAP_RECOVERY;
-	} else {
-		elants_i2c_query_test_version(ts);
-		elants_i2c_query_bc_version(ts);
-		elants_i2c_query_ts_info(ts);
-	}
 
 	return 0;
 }
@@ -601,33 +619,94 @@ static int elants_i2c_fw_write_page(struct i2c_client *client,
 	return error;
 }
 
+static int elants_i2c_validate_remark_id(struct elants_data *ts,
+					 const struct firmware *fw)
+{
+	struct i2c_client *client = ts->client;
+	int error;
+	const u8 cmd[] = { CMD_HEADER_ROM_READ, 0x80, 0x1F, 0x00, 0x00, 0x21 };
+	u8 resp[6] = { 0 };
+	u16 ts_remark_id = 0;
+	u16 fw_remark_id = 0;
+
+	/* Compare TS Remark ID and FW Remark ID */
+	error = elants_i2c_execute_command(client, cmd, sizeof(cmd),
+					resp, sizeof(resp));
+	if (error) {
+		dev_err(&client->dev, "failed to query Remark ID: %d\n", error);
+		return error;
+	}
+
+	ts_remark_id = get_unaligned_be16(&resp[3]);
+
+	fw_remark_id = get_unaligned_le16(&fw->data[fw->size - 4]);
+
+	if (fw_remark_id != ts_remark_id) {
+		dev_err(&client->dev,
+			"Remark ID Mismatched: ts_remark_id=0x%04x, fw_remark_id=0x%04x.\n",
+			ts_remark_id, fw_remark_id);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int elants_i2c_do_update_firmware(struct i2c_client *client,
 					 const struct firmware *fw,
 					 bool force)
 {
+	struct elants_data *ts = i2c_get_clientdata(client);
 	const u8 enter_iap[] = { 0x45, 0x49, 0x41, 0x50 };
 	const u8 enter_iap2[] = { 0x54, 0x00, 0x12, 0x34 };
 	const u8 iap_ack[] = { 0x55, 0xaa, 0x33, 0xcc };
+	const u8 close_idle[] = { 0x54, 0x2c, 0x01, 0x01 };
 	u8 buf[HEADER_SIZE];
 	u16 send_id;
 	int page, n_fw_pages;
 	int error;
+	bool check_remark_id = ts->iap_version >= 0x60;
 
 	/* Recovery mode detection! */
 	if (force) {
 		dev_dbg(&client->dev, "Recovery mode procedure\n");
+
+		if (check_remark_id) {
+			error = elants_i2c_validate_remark_id(ts, fw);
+			if (error)
+				return error;
+		}
+
 		error = elants_i2c_send(client, enter_iap2, sizeof(enter_iap2));
+		if (error) {
+			dev_err(&client->dev, "failed to enter IAP mode: %d\n",
+				error);
+			return error;
+		}
 	} else {
 		/* Start IAP Procedure */
 		dev_dbg(&client->dev, "Normal IAP procedure\n");
+
+		/* Close idle mode */
+		error = elants_i2c_send(client, close_idle, sizeof(close_idle));
+		if (error)
+			dev_err(&client->dev, "Failed close idle: %d\n", error);
+		msleep(60);
+
 		elants_i2c_sw_reset(client);
+		msleep(20);
+
+		if (check_remark_id) {
+			error = elants_i2c_validate_remark_id(ts, fw);
+			if (error)
+				return error;
+		}
 
 		error = elants_i2c_send(client, enter_iap, sizeof(enter_iap));
-	}
-
-	if (error) {
-		dev_err(&client->dev, "failed to enter IAP mode: %d\n", error);
-		return error;
+		if (error) {
+			dev_err(&client->dev, "failed to enter IAP mode: %d\n",
+				error);
+			return error;
+		}
 	}
 
 	msleep(20);
@@ -699,12 +778,19 @@ static int elants_i2c_fw_update(struct elants_data *ts)
 {
 	struct i2c_client *client = ts->client;
 	const struct firmware *fw;
+	char *fw_name;
 	int error;
 
-	error = request_firmware(&fw, ELAN_FW_FILENAME, &client->dev);
+	fw_name = kasprintf(GFP_KERNEL, "elants_i2c_%04x.bin", ts->hw_version);
+	if (!fw_name)
+		return -ENOMEM;
+
+	dev_info(&client->dev, "requesting fw name = %s\n", fw_name);
+	error = request_firmware(&fw, fw_name, &client->dev);
+	kfree(fw_name);
 	if (error) {
-		dev_err(&client->dev, "failed to request firmware %s: %d\n",
-			ELAN_FW_FILENAME, error);
+		dev_err(&client->dev, "failed to request firmware: %d\n",
+			error);
 		return error;
 	}
 
@@ -834,7 +920,7 @@ static irqreturn_t elants_i2c_irq(int irq, void *_dev)
 	int i;
 	int len;
 
-	len = i2c_master_recv(client, ts->buf, sizeof(ts->buf));
+	len = i2c_master_recv_dmasafe(client, ts->buf, sizeof(ts->buf));
 	if (len < 0) {
 		dev_err(&client->dev, "%s: failed to read data: %d\n",
 			__func__, len);
@@ -885,9 +971,9 @@ static irqreturn_t elants_i2c_irq(int irq, void *_dev)
 
 		case QUEUE_HEADER_NORMAL:
 			report_count = ts->buf[FW_HDR_COUNT];
-			if (report_count > 3) {
+			if (report_count == 0 || report_count > 3) {
 				dev_err(&client->dev,
-					"too large report count: %*ph\n",
+					"bad report count: %*ph\n",
 					HEADER_SIZE, ts->buf);
 				break;
 			}
@@ -970,7 +1056,7 @@ static ssize_t show_iap_mode(struct device *dev,
 				"Normal" : "Recovery");
 }
 
-static DEVICE_ATTR(calibrate, S_IWUSR, NULL, calibrate_store);
+static DEVICE_ATTR_WO(calibrate);
 static DEVICE_ATTR(iap_mode, S_IRUGO, show_iap_mode, NULL);
 static DEVICE_ATTR(update_fw, S_IWUSR, NULL, write_update_fw);
 
@@ -1037,15 +1123,69 @@ static struct attribute *elants_attributes[] = {
 	NULL
 };
 
-static struct attribute_group elants_attribute_group = {
+static const struct attribute_group elants_attribute_group = {
 	.attrs = elants_attributes,
 };
 
-static void elants_i2c_remove_sysfs_group(void *_data)
+static int elants_i2c_power_on(struct elants_data *ts)
+{
+	int error;
+
+	/*
+	 * If we do not have reset gpio assume platform firmware
+	 * controls regulators and does power them on for us.
+	 */
+	if (IS_ERR_OR_NULL(ts->reset_gpio))
+		return 0;
+
+	gpiod_set_value_cansleep(ts->reset_gpio, 1);
+
+	error = regulator_enable(ts->vcc33);
+	if (error) {
+		dev_err(&ts->client->dev,
+			"failed to enable vcc33 regulator: %d\n",
+			error);
+		goto release_reset_gpio;
+	}
+
+	error = regulator_enable(ts->vccio);
+	if (error) {
+		dev_err(&ts->client->dev,
+			"failed to enable vccio regulator: %d\n",
+			error);
+		regulator_disable(ts->vcc33);
+		goto release_reset_gpio;
+	}
+
+	/*
+	 * We need to wait a bit after powering on controller before
+	 * we are allowed to release reset GPIO.
+	 */
+	udelay(ELAN_POWERON_DELAY_USEC);
+
+release_reset_gpio:
+	gpiod_set_value_cansleep(ts->reset_gpio, 0);
+	if (error)
+		return error;
+
+	msleep(ELAN_RESET_DELAY_MSEC);
+
+	return 0;
+}
+
+static void elants_i2c_power_off(void *_data)
 {
 	struct elants_data *ts = _data;
 
-	sysfs_remove_group(&ts->client->dev.kobj, &elants_attribute_group);
+	if (!IS_ERR_OR_NULL(ts->reset_gpio)) {
+		/*
+		 * Activate reset gpio to prevent leakage through the
+		 * pin once we shut off power to the controller.
+		 */
+		gpiod_set_value_cansleep(ts->reset_gpio, 1);
+		regulator_disable(ts->vccio);
+		regulator_disable(ts->vcc33);
+	}
 }
 
 static int elants_i2c_probe(struct i2c_client *client,
@@ -1062,13 +1202,6 @@ static int elants_i2c_probe(struct i2c_client *client,
 		return -ENXIO;
 	}
 
-	/* Make sure there is something at this address */
-	if (i2c_smbus_xfer(client->adapter, client->addr, 0,
-			I2C_SMBUS_READ, 0, I2C_SMBUS_BYTE, &dummy) < 0) {
-		dev_err(&client->dev, "nothing at this address\n");
-		return -ENXIO;
-	}
-
 	ts = devm_kzalloc(&client->dev, sizeof(struct elants_data), GFP_KERNEL);
 	if (!ts)
 		return -ENOMEM;
@@ -1078,6 +1211,62 @@ static int elants_i2c_probe(struct i2c_client *client,
 
 	ts->client = client;
 	i2c_set_clientdata(client, ts);
+
+	ts->vcc33 = devm_regulator_get(&client->dev, "vcc33");
+	if (IS_ERR(ts->vcc33)) {
+		error = PTR_ERR(ts->vcc33);
+		if (error != -EPROBE_DEFER)
+			dev_err(&client->dev,
+				"Failed to get 'vcc33' regulator: %d\n",
+				error);
+		return error;
+	}
+
+	ts->vccio = devm_regulator_get(&client->dev, "vccio");
+	if (IS_ERR(ts->vccio)) {
+		error = PTR_ERR(ts->vccio);
+		if (error != -EPROBE_DEFER)
+			dev_err(&client->dev,
+				"Failed to get 'vccio' regulator: %d\n",
+				error);
+		return error;
+	}
+
+	ts->reset_gpio = devm_gpiod_get(&client->dev, "reset", GPIOD_OUT_LOW);
+	if (IS_ERR(ts->reset_gpio)) {
+		error = PTR_ERR(ts->reset_gpio);
+
+		if (error == -EPROBE_DEFER)
+			return error;
+
+		if (error != -ENOENT && error != -ENOSYS) {
+			dev_err(&client->dev,
+				"failed to get reset gpio: %d\n",
+				error);
+			return error;
+		}
+
+		ts->keep_power_in_suspend = true;
+	}
+
+	error = elants_i2c_power_on(ts);
+	if (error)
+		return error;
+
+	error = devm_add_action(&client->dev, elants_i2c_power_off, ts);
+	if (error) {
+		dev_err(&client->dev,
+			"failed to install power off action: %d\n", error);
+		elants_i2c_power_off(ts);
+		return error;
+	}
+
+	/* Make sure there is something at this address */
+	if (i2c_smbus_xfer(client->adapter, client->addr, 0,
+			   I2C_SMBUS_READ, 0, I2C_SMBUS_BYTE, &dummy) < 0) {
+		dev_err(&client->dev, "nothing at this address\n");
+		return -ENXIO;
+	}
 
 	error = elants_i2c_initialize(ts);
 	if (error) {
@@ -1120,8 +1309,7 @@ static int elants_i2c_probe(struct i2c_client *client,
 	input_set_abs_params(ts->input, ABS_MT_PRESSURE, 0, 255, 0, 0);
 	input_abs_set_res(ts->input, ABS_MT_POSITION_X, ts->x_res);
 	input_abs_set_res(ts->input, ABS_MT_POSITION_Y, ts->y_res);
-
-	input_set_drvdata(ts->input, ts);
+	input_abs_set_res(ts->input, ABS_MT_TOUCH_MAJOR, 1);
 
 	error = input_register_device(ts->input);
 	if (error) {
@@ -1131,10 +1319,13 @@ static int elants_i2c_probe(struct i2c_client *client,
 	}
 
 	/*
-	 * Systems using device tree should set up interrupt via DTS,
-	 * the rest will use the default falling edge interrupts.
+	 * Platform code (ACPI, DTS) should normally set up interrupt
+	 * for us, but in case it did not let's fall back to using falling
+	 * edge to be compatible with older Chromebooks.
 	 */
-	irqflags = client->dev.of_node ? 0 : IRQF_TRIGGER_FALLING;
+	irqflags = irq_get_trigger_type(client->irq);
+	if (!irqflags)
+		irqflags = IRQF_TRIGGER_FALLING;
 
 	error = devm_request_threaded_irq(&client->dev, client->irq,
 					  NULL, elants_i2c_irq,
@@ -1152,19 +1343,9 @@ static int elants_i2c_probe(struct i2c_client *client,
 	if (!client->dev.of_node)
 		device_init_wakeup(&client->dev, true);
 
-	error = sysfs_create_group(&client->dev.kobj, &elants_attribute_group);
+	error = devm_device_add_group(&client->dev, &elants_attribute_group);
 	if (error) {
 		dev_err(&client->dev, "failed to create sysfs attributes: %d\n",
-			error);
-		return error;
-	}
-
-	error = devm_add_action(&client->dev,
-				elants_i2c_remove_sysfs_group, ts);
-	if (error) {
-		elants_i2c_remove_sysfs_group(ts);
-		dev_err(&client->dev,
-			"Failed to add sysfs cleanup action: %d\n",
 			error);
 		return error;
 	}
@@ -1186,17 +1367,25 @@ static int __maybe_unused elants_i2c_suspend(struct device *dev)
 
 	disable_irq(client->irq);
 
-	for (retry_cnt = 0; retry_cnt < MAX_RETRIES; retry_cnt++) {
-		error = elants_i2c_send(client, set_sleep_cmd,
-					sizeof(set_sleep_cmd));
-		if (!error)
-			break;
-
-		dev_err(&client->dev, "suspend command failed: %d\n", error);
-	}
-
-	if (device_may_wakeup(dev))
+	if (device_may_wakeup(dev)) {
+		/*
+		 * The device will automatically enter idle mode
+		 * that has reduced power consumption.
+		 */
 		ts->wake_irq_enabled = (enable_irq_wake(client->irq) == 0);
+	} else if (ts->keep_power_in_suspend) {
+		for (retry_cnt = 0; retry_cnt < MAX_RETRIES; retry_cnt++) {
+			error = elants_i2c_send(client, set_sleep_cmd,
+						sizeof(set_sleep_cmd));
+			if (!error)
+				break;
+
+			dev_err(&client->dev,
+				"suspend command failed: %d\n", error);
+		}
+	} else {
+		elants_i2c_power_off(ts);
+	}
 
 	return 0;
 }
@@ -1209,16 +1398,23 @@ static int __maybe_unused elants_i2c_resume(struct device *dev)
 	int retry_cnt;
 	int error;
 
-	if (device_may_wakeup(dev) && ts->wake_irq_enabled)
-		disable_irq_wake(client->irq);
+	if (device_may_wakeup(dev)) {
+		if (ts->wake_irq_enabled)
+			disable_irq_wake(client->irq);
+		elants_i2c_sw_reset(client);
+	} else if (ts->keep_power_in_suspend) {
+		for (retry_cnt = 0; retry_cnt < MAX_RETRIES; retry_cnt++) {
+			error = elants_i2c_send(client, set_active_cmd,
+						sizeof(set_active_cmd));
+			if (!error)
+				break;
 
-	for (retry_cnt = 0; retry_cnt < MAX_RETRIES; retry_cnt++) {
-		error = elants_i2c_send(client, set_active_cmd,
-					sizeof(set_active_cmd));
-		if (!error)
-			break;
-
-		dev_err(&client->dev, "resume command failed: %d\n", error);
+			dev_err(&client->dev,
+				"resume command failed: %d\n", error);
+		}
+	} else {
+		elants_i2c_power_on(ts);
+		elants_i2c_initialize(ts);
 	}
 
 	ts->state = ELAN_STATE_NORMAL;
@@ -1257,15 +1453,14 @@ static struct i2c_driver elants_i2c_driver = {
 	.id_table = elants_i2c_id,
 	.driver = {
 		.name = DEVICE_NAME,
-		.owner = THIS_MODULE,
 		.pm = &elants_i2c_pm_ops,
 		.acpi_match_table = ACPI_PTR(elants_acpi_id),
 		.of_match_table = of_match_ptr(elants_of_match),
+		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 	},
 };
 module_i2c_driver(elants_i2c_driver);
 
 MODULE_AUTHOR("Scott Liu <scott.liu@emc.com.tw>");
 MODULE_DESCRIPTION("Elan I2c Touchscreen driver");
-MODULE_VERSION(DRV_VERSION);
 MODULE_LICENSE("GPL");

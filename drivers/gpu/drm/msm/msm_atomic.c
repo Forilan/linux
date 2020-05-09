@@ -1,163 +1,247 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (C) 2014 Red Hat
  * Author: Rob Clark <robdclark@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- * You should have received a copy of the GNU General Public License along with
- * this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <drm/drm_atomic_uapi.h>
+#include <drm/drm_gem_framebuffer_helper.h>
+#include <drm/drm_vblank.h>
+
+#include "msm_atomic_trace.h"
 #include "msm_drv.h"
-#include "msm_kms.h"
 #include "msm_gem.h"
+#include "msm_kms.h"
 
-struct msm_commit {
-	struct drm_atomic_state *state;
-	uint32_t fence;
-	struct msm_fence_cb fence_cb;
-};
-
-static void fence_cb(struct msm_fence_cb *cb);
-
-static struct msm_commit *new_commit(struct drm_atomic_state *state)
+int msm_atomic_prepare_fb(struct drm_plane *plane,
+			  struct drm_plane_state *new_state)
 {
-	struct msm_commit *c = kzalloc(sizeof(*c), GFP_KERNEL);
+	struct msm_drm_private *priv = plane->dev->dev_private;
+	struct msm_kms *kms = priv->kms;
 
-	if (!c)
-		return NULL;
+	if (!new_state->fb)
+		return 0;
 
-	c->state = state;
-	/* TODO we might need a way to indicate to run the cb on a
-	 * different wq so wait_for_vblanks() doesn't block retiring
-	 * bo's..
-	 */
-	INIT_FENCE_CB(&c->fence_cb, fence_cb);
+	drm_gem_fb_prepare_fb(plane, new_state);
 
-	return c;
+	return msm_framebuffer_prepare(new_state->fb, kms->aspace);
 }
 
-/* The (potentially) asynchronous part of the commit.  At this point
- * nothing can fail short of armageddon.
- */
-static void complete_commit(struct msm_commit *c)
+static void msm_atomic_async_commit(struct msm_kms *kms, int crtc_idx)
 {
-	struct drm_atomic_state *state = c->state;
-	struct drm_device *dev = state->dev;
+	unsigned crtc_mask = BIT(crtc_idx);
 
-	drm_atomic_helper_commit_pre_planes(dev, state);
+	trace_msm_atomic_async_commit_start(crtc_mask);
 
-	drm_atomic_helper_commit_planes(dev, state);
+	mutex_lock(&kms->commit_lock);
 
-	drm_atomic_helper_commit_post_planes(dev, state);
-
-	drm_atomic_helper_wait_for_vblanks(dev, state);
-
-	drm_atomic_helper_cleanup_planes(dev, state);
-
-	drm_atomic_state_free(state);
-
-	kfree(c);
-}
-
-static void fence_cb(struct msm_fence_cb *cb)
-{
-	struct msm_commit *c =
-			container_of(cb, struct msm_commit, fence_cb);
-	complete_commit(c);
-}
-
-static void add_fb(struct msm_commit *c, struct drm_framebuffer *fb)
-{
-	struct drm_gem_object *obj = msm_framebuffer_bo(fb, 0);
-	c->fence = max(c->fence, msm_gem_fence(to_msm_bo(obj), MSM_PREP_READ));
-}
-
-
-/**
- * drm_atomic_helper_commit - commit validated state object
- * @dev: DRM device
- * @state: the driver state object
- * @async: asynchronous commit
- *
- * This function commits a with drm_atomic_helper_check() pre-validated state
- * object. This can still fail when e.g. the framebuffer reservation fails. For
- * now this doesn't implement asynchronous commits.
- *
- * RETURNS
- * Zero for success or -errno.
- */
-int msm_atomic_commit(struct drm_device *dev,
-		struct drm_atomic_state *state, bool async)
-{
-	struct msm_commit *c;
-	int nplanes = dev->mode_config.num_total_plane;
-	int i, ret;
-
-	ret = drm_atomic_helper_prepare_planes(dev, state);
-	if (ret)
-		return ret;
-
-	c = new_commit(state);
-
-	/*
-	 * Figure out what fence to wait for:
-	 */
-	for (i = 0; i < nplanes; i++) {
-		struct drm_plane *plane = state->planes[i];
-		struct drm_plane_state *new_state = state->plane_states[i];
-
-		if (!plane)
-			continue;
-
-		if ((plane->state->fb != new_state->fb) && new_state->fb)
-			add_fb(c, new_state->fb);
+	if (!(kms->pending_crtc_mask & crtc_mask)) {
+		mutex_unlock(&kms->commit_lock);
+		goto out;
 	}
 
-	/*
-	 * This is the point of no return - everything below never fails except
-	 * when the hw goes bonghits. Which means we can commit the new state on
-	 * the software side now.
-	 */
+	kms->pending_crtc_mask &= ~crtc_mask;
 
-	drm_atomic_helper_swap_state(dev, state);
+	kms->funcs->enable_commit(kms);
 
 	/*
-	 * Everything below can be run asynchronously without the need to grab
-	 * any modeset locks at all under one conditions: It must be guaranteed
-	 * that the asynchronous work has either been cancelled (if the driver
-	 * supports it, which at least requires that the framebuffers get
-	 * cleaned up with drm_atomic_helper_cleanup_planes()) or completed
-	 * before the new state gets committed on the software side with
-	 * drm_atomic_helper_swap_state().
-	 *
-	 * This scheme allows new atomic state updates to be prepared and
-	 * checked in parallel to the asynchronous completion of the previous
-	 * update. Which is important since compositors need to figure out the
-	 * composition of the next frame right after having submitted the
-	 * current layout.
+	 * Flush hardware updates:
 	 */
+	trace_msm_atomic_flush_commit(crtc_mask);
+	kms->funcs->flush_commit(kms, crtc_mask);
+	mutex_unlock(&kms->commit_lock);
+
+	/*
+	 * Wait for flush to complete:
+	 */
+	trace_msm_atomic_wait_flush_start(crtc_mask);
+	kms->funcs->wait_flush(kms, crtc_mask);
+	trace_msm_atomic_wait_flush_finish(crtc_mask);
+
+	mutex_lock(&kms->commit_lock);
+	kms->funcs->complete_commit(kms, crtc_mask);
+	mutex_unlock(&kms->commit_lock);
+	kms->funcs->disable_commit(kms);
+
+out:
+	trace_msm_atomic_async_commit_finish(crtc_mask);
+}
+
+static enum hrtimer_restart msm_atomic_pending_timer(struct hrtimer *t)
+{
+	struct msm_pending_timer *timer = container_of(t,
+			struct msm_pending_timer, timer);
+	struct msm_drm_private *priv = timer->kms->dev->dev_private;
+
+	queue_work(priv->wq, &timer->work);
+
+	return HRTIMER_NORESTART;
+}
+
+static void msm_atomic_pending_work(struct work_struct *work)
+{
+	struct msm_pending_timer *timer = container_of(work,
+			struct msm_pending_timer, work);
+
+	msm_atomic_async_commit(timer->kms, timer->crtc_idx);
+}
+
+void msm_atomic_init_pending_timer(struct msm_pending_timer *timer,
+		struct msm_kms *kms, int crtc_idx)
+{
+	timer->kms = kms;
+	timer->crtc_idx = crtc_idx;
+	hrtimer_init(&timer->timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+	timer->timer.function = msm_atomic_pending_timer;
+	INIT_WORK(&timer->work, msm_atomic_pending_work);
+}
+
+static bool can_do_async(struct drm_atomic_state *state,
+		struct drm_crtc **async_crtc)
+{
+	struct drm_connector_state *connector_state;
+	struct drm_connector *connector;
+	struct drm_crtc_state *crtc_state;
+	struct drm_crtc *crtc;
+	int i, num_crtcs = 0;
+
+	if (!(state->legacy_cursor_update || state->async_update))
+		return false;
+
+	/* any connector change, means slow path: */
+	for_each_new_connector_in_state(state, connector, connector_state, i)
+		return false;
+
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+		if (drm_atomic_crtc_needs_modeset(crtc_state))
+			return false;
+		if (++num_crtcs > 1)
+			return false;
+		*async_crtc = crtc;
+	}
+
+	return true;
+}
+
+/* Get bitmask of crtcs that will need to be flushed.  The bitmask
+ * can be used with for_each_crtc_mask() iterator, to iterate
+ * effected crtcs without needing to preserve the atomic state.
+ */
+static unsigned get_crtc_mask(struct drm_atomic_state *state)
+{
+	struct drm_crtc_state *crtc_state;
+	struct drm_crtc *crtc;
+	unsigned i, mask = 0;
+
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i)
+		mask |= drm_crtc_mask(crtc);
+
+	return mask;
+}
+
+void msm_atomic_commit_tail(struct drm_atomic_state *state)
+{
+	struct drm_device *dev = state->dev;
+	struct msm_drm_private *priv = dev->dev_private;
+	struct msm_kms *kms = priv->kms;
+	struct drm_crtc *async_crtc = NULL;
+	unsigned crtc_mask = get_crtc_mask(state);
+	bool async = kms->funcs->vsync_time &&
+			can_do_async(state, &async_crtc);
+
+	trace_msm_atomic_commit_tail_start(async, crtc_mask);
+
+	kms->funcs->enable_commit(kms);
+
+	/*
+	 * Ensure any previous (potentially async) commit has
+	 * completed:
+	 */
+	trace_msm_atomic_wait_flush_start(crtc_mask);
+	kms->funcs->wait_flush(kms, crtc_mask);
+	trace_msm_atomic_wait_flush_finish(crtc_mask);
+
+	mutex_lock(&kms->commit_lock);
+
+	/*
+	 * Now that there is no in-progress flush, prepare the
+	 * current update:
+	 */
+	kms->funcs->prepare_commit(kms, state);
+
+	/*
+	 * Push atomic updates down to hardware:
+	 */
+	drm_atomic_helper_commit_modeset_disables(dev, state);
+	drm_atomic_helper_commit_planes(dev, state, 0);
+	drm_atomic_helper_commit_modeset_enables(dev, state);
 
 	if (async) {
-		msm_queue_fence_cb(dev, &c->fence_cb, c->fence);
-		return 0;
+		struct msm_pending_timer *timer =
+			&kms->pending_timers[drm_crtc_index(async_crtc)];
+
+		/* async updates are limited to single-crtc updates: */
+		WARN_ON(crtc_mask != drm_crtc_mask(async_crtc));
+
+		/*
+		 * Start timer if we don't already have an update pending
+		 * on this crtc:
+		 */
+		if (!(kms->pending_crtc_mask & crtc_mask)) {
+			ktime_t vsync_time, wakeup_time;
+
+			kms->pending_crtc_mask |= crtc_mask;
+
+			vsync_time = kms->funcs->vsync_time(kms, async_crtc);
+			wakeup_time = ktime_sub(vsync_time, ms_to_ktime(1));
+
+			hrtimer_start(&timer->timer, wakeup_time,
+					HRTIMER_MODE_ABS);
+		}
+
+		kms->funcs->disable_commit(kms);
+		mutex_unlock(&kms->commit_lock);
+
+		/*
+		 * At this point, from drm core's perspective, we
+		 * are done with the atomic update, so we can just
+		 * go ahead and signal that it is done:
+		 */
+		drm_atomic_helper_commit_hw_done(state);
+		drm_atomic_helper_cleanup_planes(dev, state);
+
+		trace_msm_atomic_commit_tail_finish(async, crtc_mask);
+
+		return;
 	}
 
-	ret = msm_wait_fence_interruptable(dev, c->fence, NULL);
-	if (ret) {
-		WARN_ON(ret);  // TODO unswap state back?  or??
-		kfree(c);
-		return ret;
-	}
+	/*
+	 * If there is any async flush pending on updated crtcs, fold
+	 * them into the current flush.
+	 */
+	kms->pending_crtc_mask &= ~crtc_mask;
 
-	complete_commit(c);
+	/*
+	 * Flush hardware updates:
+	 */
+	trace_msm_atomic_flush_commit(crtc_mask);
+	kms->funcs->flush_commit(kms, crtc_mask);
+	mutex_unlock(&kms->commit_lock);
 
-	return 0;
+	/*
+	 * Wait for flush to complete:
+	 */
+	trace_msm_atomic_wait_flush_start(crtc_mask);
+	kms->funcs->wait_flush(kms, crtc_mask);
+	trace_msm_atomic_wait_flush_finish(crtc_mask);
+
+	mutex_lock(&kms->commit_lock);
+	kms->funcs->complete_commit(kms, crtc_mask);
+	mutex_unlock(&kms->commit_lock);
+	kms->funcs->disable_commit(kms);
+
+	drm_atomic_helper_commit_hw_done(state);
+	drm_atomic_helper_cleanup_planes(dev, state);
+
+	trace_msm_atomic_commit_tail_finish(async, crtc_mask);
 }

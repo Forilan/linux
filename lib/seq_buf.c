@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * seq_buf.c
  *
@@ -61,7 +62,7 @@ int seq_buf_vprintf(struct seq_buf *s, const char *fmt, va_list args)
 
 	if (s->len < s->size) {
 		len = vsnprintf(s->buffer + s->len, s->size - s->len, fmt, args);
-		if (seq_buf_can_fit(s, len)) {
+		if (s->len + len < s->size) {
 			s->len += len;
 			return 0;
 		}
@@ -91,42 +92,6 @@ int seq_buf_printf(struct seq_buf *s, const char *fmt, ...)
 	return ret;
 }
 
-/**
- * seq_buf_bitmask - write a bitmask array in its ASCII representation
- * @s:		seq_buf descriptor
- * @maskp:	points to an array of unsigned longs that represent a bitmask
- * @nmaskbits:	The number of bits that are valid in @maskp
- *
- * Writes a ASCII representation of a bitmask string into @s.
- *
- * Returns zero on success, -1 on overflow.
- */
-int seq_buf_bitmask(struct seq_buf *s, const unsigned long *maskp,
-		    int nmaskbits)
-{
-	unsigned int len = seq_buf_buffer_left(s);
-	int ret;
-
-	WARN_ON(s->size == 0);
-
-	/*
-	 * Note, because bitmap_scnprintf() only returns the number of bytes
-	 * written and not the number that would be written, we use the last
-	 * byte of the buffer to let us know if we overflowed. There's a small
-	 * chance that the bitmap could have fit exactly inside the buffer, but
-	 * it's not that critical if that does happen.
-	 */
-	if (len > 1) {
-		ret = bitmap_scnprintf(s->buffer + s->len, len, maskp, nmaskbits);
-		if (ret < len) {
-			s->len += ret;
-			return 0;
-		}
-	}
-	seq_buf_set_overflow(s);
-	return -1;
-}
-
 #ifdef CONFIG_BINARY_PRINTF
 /**
  * seq_buf_bprintf - Write the printf string from binary arguments
@@ -154,7 +119,7 @@ int seq_buf_bprintf(struct seq_buf *s, const char *fmt, const u32 *binary)
 
 	if (s->len < s->size) {
 		ret = bstr_printf(s->buffer + s->len, len, fmt, binary);
-		if (seq_buf_can_fit(s, ret)) {
+		if (s->len + ret < s->size) {
 			s->len += ret;
 			return 0;
 		}
@@ -175,13 +140,17 @@ int seq_buf_bprintf(struct seq_buf *s, const char *fmt, const u32 *binary)
  */
 int seq_buf_puts(struct seq_buf *s, const char *str)
 {
-	unsigned int len = strlen(str);
+	size_t len = strlen(str);
 
 	WARN_ON(s->size == 0);
 
+	/* Add 1 to len for the trailing null byte which must be there */
+	len += 1;
+
 	if (seq_buf_can_fit(s, len)) {
 		memcpy(s->buffer + s->len, str, len);
-		s->len += len;
+		/* Don't count the trailing null byte against the capacity */
+		s->len += len - 1;
 		return 0;
 	}
 	seq_buf_set_overflow(s);
@@ -342,10 +311,12 @@ int seq_buf_to_user(struct seq_buf *s, char __user *ubuf, int cnt)
 	if (!cnt)
 		return 0;
 
-	if (s->len <= s->readpos)
+	len = seq_buf_used(s);
+
+	if (len <= s->readpos)
 		return -EBUSY;
 
-	len = seq_buf_used(s) - s->readpos;
+	len -= s->readpos;
 	if (cnt > len)
 		cnt = len;
 	ret = copy_to_user(ubuf, s->buffer + s->readpos, cnt);
@@ -356,4 +327,66 @@ int seq_buf_to_user(struct seq_buf *s, char __user *ubuf, int cnt)
 
 	s->readpos += cnt;
 	return cnt;
+}
+
+/**
+ * seq_buf_hex_dump - print formatted hex dump into the sequence buffer
+ * @s: seq_buf descriptor
+ * @prefix_str: string to prefix each line with;
+ *  caller supplies trailing spaces for alignment if desired
+ * @prefix_type: controls whether prefix of an offset, address, or none
+ *  is printed (%DUMP_PREFIX_OFFSET, %DUMP_PREFIX_ADDRESS, %DUMP_PREFIX_NONE)
+ * @rowsize: number of bytes to print per line; must be 16 or 32
+ * @groupsize: number of bytes to print at a time (1, 2, 4, 8; default = 1)
+ * @buf: data blob to dump
+ * @len: number of bytes in the @buf
+ * @ascii: include ASCII after the hex output
+ *
+ * Function is an analogue of print_hex_dump() and thus has similar interface.
+ *
+ * linebuf size is maximal length for one line.
+ * 32 * 3 - maximum bytes per line, each printed into 2 chars + 1 for
+ *	separating space
+ * 2 - spaces separating hex dump and ascii representation
+ * 32 - ascii representation
+ * 1 - terminating '\0'
+ *
+ * Returns zero on success, -1 on overflow
+ */
+int seq_buf_hex_dump(struct seq_buf *s, const char *prefix_str, int prefix_type,
+		     int rowsize, int groupsize,
+		     const void *buf, size_t len, bool ascii)
+{
+	const u8 *ptr = buf;
+	int i, linelen, remaining = len;
+	unsigned char linebuf[32 * 3 + 2 + 32 + 1];
+	int ret;
+
+	if (rowsize != 16 && rowsize != 32)
+		rowsize = 16;
+
+	for (i = 0; i < len; i += rowsize) {
+		linelen = min(remaining, rowsize);
+		remaining -= rowsize;
+
+		hex_dump_to_buffer(ptr + i, linelen, rowsize, groupsize,
+				   linebuf, sizeof(linebuf), ascii);
+
+		switch (prefix_type) {
+		case DUMP_PREFIX_ADDRESS:
+			ret = seq_buf_printf(s, "%s%p: %s\n",
+			       prefix_str, ptr + i, linebuf);
+			break;
+		case DUMP_PREFIX_OFFSET:
+			ret = seq_buf_printf(s, "%s%.8x: %s\n",
+					     prefix_str, i, linebuf);
+			break;
+		default:
+			ret = seq_buf_printf(s, "%s%s\n", prefix_str, linebuf);
+			break;
+		}
+		if (ret)
+			return ret;
+	}
+	return 0;
 }

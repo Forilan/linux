@@ -31,22 +31,27 @@
 #include <linux/virtio_types.h>
 
 /* Feature bits */
-#define VIRTIO_BLK_F_BARRIER	0	/* Does host support barriers? */
 #define VIRTIO_BLK_F_SIZE_MAX	1	/* Indicates maximum segment size */
 #define VIRTIO_BLK_F_SEG_MAX	2	/* Indicates maximum # of segments */
 #define VIRTIO_BLK_F_GEOMETRY	4	/* Legacy geometry available  */
 #define VIRTIO_BLK_F_RO		5	/* Disk is read-only */
 #define VIRTIO_BLK_F_BLK_SIZE	6	/* Block size of disk is available*/
-#define VIRTIO_BLK_F_SCSI	7	/* Supports scsi command passthru */
-#define VIRTIO_BLK_F_WCE	9	/* Writeback mode enabled after reset */
 #define VIRTIO_BLK_F_TOPOLOGY	10	/* Topology information is available */
-#define VIRTIO_BLK_F_CONFIG_WCE	11	/* Writeback mode available in config */
 #define VIRTIO_BLK_F_MQ		12	/* support more than one vq */
+#define VIRTIO_BLK_F_DISCARD	13	/* DISCARD is supported */
+#define VIRTIO_BLK_F_WRITE_ZEROES	14	/* WRITE ZEROES is supported */
 
+/* Legacy feature bits */
+#ifndef VIRTIO_BLK_NO_LEGACY
+#define VIRTIO_BLK_F_BARRIER	0	/* Does host support barriers? */
+#define VIRTIO_BLK_F_SCSI	7	/* Supports scsi command passthru */
+#define VIRTIO_BLK_F_FLUSH	9	/* Flush command supported */
+#define VIRTIO_BLK_F_CONFIG_WCE	11	/* Writeback mode available in config */
 #ifndef __KERNEL__
-/* Old (deprecated) name for VIRTIO_BLK_F_WCE. */
-#define VIRTIO_BLK_F_FLUSH VIRTIO_BLK_F_WCE
+/* Old (deprecated) name for VIRTIO_BLK_F_FLUSH. */
+#define VIRTIO_BLK_F_WCE VIRTIO_BLK_F_FLUSH
 #endif
+#endif /* !VIRTIO_BLK_NO_LEGACY */
 
 #define VIRTIO_BLK_ID_BYTES	20	/* ID string length */
 
@@ -57,7 +62,7 @@ struct virtio_blk_config {
 	__u32 size_max;
 	/* The maximum number of segments (if VIRTIO_BLK_F_SEG_MAX) */
 	__u32 seg_max;
-	/* geometry the device (if VIRTIO_BLK_F_GEOMETRY) */
+	/* geometry of the device (if VIRTIO_BLK_F_GEOMETRY) */
 	struct virtio_blk_geometry {
 		__u16 cylinders;
 		__u8 heads;
@@ -83,6 +88,39 @@ struct virtio_blk_config {
 
 	/* number of vqs, only available when VIRTIO_BLK_F_MQ is set */
 	__u16 num_queues;
+
+	/* the next 3 entries are guarded by VIRTIO_BLK_F_DISCARD */
+	/*
+	 * The maximum discard sectors (in 512-byte sectors) for
+	 * one segment.
+	 */
+	__u32 max_discard_sectors;
+	/*
+	 * The maximum number of discard segments in a
+	 * discard command.
+	 */
+	__u32 max_discard_seg;
+	/* Discard commands must be aligned to this number of sectors. */
+	__u32 discard_sector_alignment;
+
+	/* the next 3 entries are guarded by VIRTIO_BLK_F_WRITE_ZEROES */
+	/*
+	 * The maximum number of write zeroes sectors (in 512-byte sectors) in
+	 * one segment.
+	 */
+	__u32 max_write_zeroes_sectors;
+	/*
+	 * The maximum number of segments in a write zeroes
+	 * command.
+	 */
+	__u32 max_write_zeroes_seg;
+	/*
+	 * Set if a VIRTIO_BLK_T_WRITE_ZEROES request may result in the
+	 * deallocation of one or more of the sectors.
+	 */
+	__u8 write_zeroes_may_unmap;
+
+	__u8 unused1[3];
 } __attribute__((packed));
 
 /*
@@ -100,8 +138,10 @@ struct virtio_blk_config {
 #define VIRTIO_BLK_T_IN		0
 #define VIRTIO_BLK_T_OUT	1
 
+#ifndef VIRTIO_BLK_NO_LEGACY
 /* This bit says it's a scsi command, not an actual read or write. */
 #define VIRTIO_BLK_T_SCSI_CMD	2
+#endif /* VIRTIO_BLK_NO_LEGACY */
 
 /* Cache flush command */
 #define VIRTIO_BLK_T_FLUSH	4
@@ -109,10 +149,22 @@ struct virtio_blk_config {
 /* Get device ID command */
 #define VIRTIO_BLK_T_GET_ID    8
 
+/* Discard command */
+#define VIRTIO_BLK_T_DISCARD	11
+
+/* Write zeroes command */
+#define VIRTIO_BLK_T_WRITE_ZEROES	13
+
+#ifndef VIRTIO_BLK_NO_LEGACY
 /* Barrier before this op. */
 #define VIRTIO_BLK_T_BARRIER	0x80000000
+#endif /* !VIRTIO_BLK_NO_LEGACY */
 
-/* This is the first element of the read scatter-gather list. */
+/*
+ * This comes first in the read scatter-gather list.
+ * For legacy virtio, if VIRTIO_F_ANY_LAYOUT is not negotiated,
+ * this is the first element of the read scatter-gather list.
+ */
 struct virtio_blk_outhdr {
 	/* VIRTIO_BLK_T* */
 	__virtio32 type;
@@ -122,12 +174,27 @@ struct virtio_blk_outhdr {
 	__virtio64 sector;
 };
 
+/* Unmap this range (only valid for write zeroes command) */
+#define VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP	0x00000001
+
+/* Discard/write zeroes range for each request. */
+struct virtio_blk_discard_write_zeroes {
+	/* discard/write zeroes start sector */
+	__le64 sector;
+	/* number of discard/write zeroes sectors */
+	__le32 num_sectors;
+	/* flags for this range */
+	__le32 flags;
+};
+
+#ifndef VIRTIO_BLK_NO_LEGACY
 struct virtio_scsi_inhdr {
 	__virtio32 errors;
 	__virtio32 data_len;
 	__virtio32 sense_len;
 	__virtio32 residual;
 };
+#endif /* !VIRTIO_BLK_NO_LEGACY */
 
 /* And this is the final byte of the write scatter-gather list. */
 #define VIRTIO_BLK_S_OK		0
